@@ -1,7 +1,7 @@
 #[cfg(unix)]
 mod imp {
 //! Local TTY clients share the list process's Terminal; no cloud credentials cross IPC.
-use super::{terminal::{Terminal,Event},cli};
+use super::super::{terminal::{Terminal,Event},cli};
 use std::{path::{Path,PathBuf},sync::Arc};
 use tokio::{io::{AsyncRead,AsyncReadExt,AsyncWrite,AsyncWriteExt},net::{UnixListener,UnixStream},sync::{broadcast,mpsc,Mutex},task::JoinSet};
 use serde::{Serialize,Deserialize};
@@ -25,7 +25,7 @@ impl Drop for Server {fn drop(&mut self){let _=std::fs::remove_file(&self.path);
 impl Server {
     pub fn new()->Result<Self,String>{
         use std::os::unix::fs::DirBuilderExt;
-        let dir=std::env::temp_dir().join(format!("uu-tty-{}",super::super::wire::uuid()));
+        let dir=std::env::temp_dir().join(format!("uu-tty-{}",super::super::super::wire::uuid()));
         std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|_|"Cannot create private terminal directory")?;
         let path=dir.join("tty");
         match UnixListener::bind(&path){Ok(listener)=>Ok(Self{dir,path,listener}),Err(_)=>{let _=std::fs::remove_dir(dir);Err("Cannot bind local terminal socket".into())}}
@@ -45,7 +45,7 @@ type Sessions=Arc<std::sync::Mutex<std::collections::HashSet<u32>>>;
 struct Active {id:u32,sessions:Sessions}
 impl Drop for Active {fn drop(&mut self){self.sessions.lock().unwrap().remove(&self.id);}}
 async fn serve<S:AsyncRead+AsyncWrite+Unpin+Send+'static>(mut socket:S,t:Arc<Terminal>,opening:Arc<Mutex<()>>,active:Sessions,mut output:broadcast::Receiver<Event>)->Result<(),String>{
-    let first=tokio::time::timeout(super::TIMEOUT,read(&mut socket)).await.map_err(|_|"Local terminal open timeout")??;
+    let first=tokio::time::timeout(super::super::TIMEOUT,read(&mut socket)).await.map_err(|_|"Local terminal open timeout")??;
     let Message::Open{session,cols,rows}=first else{return Err("Expected local terminal open".into())};
     let id={let _guard=opening.lock().await;
         if session.is_some_and(|id|active.lock().unwrap().contains(&id)){return Err("Terminal session already attached locally".into())}
@@ -56,7 +56,7 @@ async fn serve<S:AsyncRead+AsyncWrite+Unpin+Send+'static>(mut socket:S,t:Arc<Ter
     let result=async{
         write(&mut socket,&Message::Ready(id)).await?;
         let(mut r,mut w)=tokio::io::split(socket);let(tx,mut commands)=mpsc::channel(32);
-        let _reader=super::Abort(tokio::spawn(async move{loop{
+        let _reader=super::super::super::Abort(tokio::spawn(async move{loop{
             let message=read(&mut r).await;let failed=message.is_err();
             if tx.send(message).await.is_err() || failed{break}
         }}));
@@ -96,20 +96,20 @@ pub async fn client(path:&Path,session:Option<u32>)->Result<(),String>{
 
 #[cfg(test)] mod tests {
     use super::*;
-    struct Mock(mpsc::Sender<super::super::Packet>);
+    struct Mock(mpsc::Sender<super::super::super::Packet>);
     #[async_trait::async_trait]
-    impl super::super::Send for Mock {
+    impl super::super::super::Send for Mock {
         async fn send(&self,c:usize,b:Vec<u8>)->Result<(),String>{self.0.send((c,b)).await.map_err(|_|"Mock closed".into())}
     }
     #[tokio::test] async fn two_local_ttys_share_one_terminal_and_close_independently(){
         tokio::time::timeout(std::time::Duration::from_secs(3),async{
-            use super::super::{terminal as term,BINARY};
+            use super::super::super::{terminal as term,BINARY};
             let(tx,mut requests)=mpsc::channel(256);let(input,rx)=mpsc::channel(256);
-            let(t,mut events)=Terminal::new(super::super::Transport(Arc::new(Mock(tx))),rx);let t=Arc::new(t);
+            let(t,mut events)=Terminal::new(super::super::super::Transport(Arc::new(Mock(tx))),rx);let t=Arc::new(t);
             let(output,_)=broadcast::channel(256);let sender=output.clone();
-            let _relay=super::super::Abort(tokio::spawn(async move{while let Some(e)=events.recv().await{let _=sender.send(e);}}));
+            let _relay=super::super::super::Abort(tokio::spawn(async move{while let Some(e)=events.recv().await{let _=sender.send(e);}}));
             let(closed,mut closes)=mpsc::channel(8);
-            let _host=super::super::Abort(tokio::spawn(async move{
+            let _host=super::super::super::Abort(tokio::spawn(async move{
                 let mut next=40;
                 while let Some((channel,b))=requests.recv().await{
                     assert_eq!(channel,BINARY);let f=term::Decoder::default().push(&b).unwrap().remove(0);
