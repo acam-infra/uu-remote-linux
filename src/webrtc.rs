@@ -254,10 +254,9 @@ impl WebRtcSession {
         if let Some(setting) = &transport.setting_engine { se = setting.clone(); }
         se.set_answering_dtls_role(DTLSRole::Server)
             .map_err(|e| format!("Configure DTLS answer role failed: {}", e))?;
-        se.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
-        // The viewer picked a ZeroTier pair even on the same LAN (36-81 ms, Wi-Fi + overlay);
-        // offering only physical interfaces keeps LAN direct, else srflx/relay like official hosts.
-        se.set_interface_filter(Box::new(|name: &str| ice_interface_allowed(name)));
+        // Filter virtual/overlay interfaces AND overlay IP subnets (Tailscale 100.64.0.0/10,
+        // fd7a:115c:a1e0::/48, ZeroTier, Clash TUN 198.18.0.0/15) across all platforms.
+        crate::ice_filter::apply_setting_engine(&mut se);
 
         let api = APIBuilder::new()
             .with_media_engine(m)
@@ -1854,6 +1853,10 @@ impl WebRtcSession {
                 };
 
                 let summary=crate::network_diagnostics::candidate_summary(&cand_str);
+                if !crate::ice_filter::remote_candidate_allowed(&cand_str) {
+                    log::info!("Skipping remote overlay host ICE candidate: protocol={} type={}",summary.protocol,summary.kind);
+                    return Ok(());
+                }
                 log::info!("Injecting Remote ICE Candidate: protocol={} type={}",summary.protocol,summary.kind);
 
                 self.pc
@@ -1985,9 +1988,9 @@ mod desktop_control_tests;
 #[path = "webrtc_lifecycle_tests.rs"]
 mod webrtc_lifecycle_tests;
 
-/// Virtual/overlay interfaces never carry the UU video path (ZeroTier, containers).
+/// Virtual/overlay interfaces never carry the UU video or tool path (Tailscale, ZeroTier, containers).
 fn ice_interface_allowed(name: &str) -> bool {
-    !["zt", "docker", "br-", "veth", "virbr", "lo"].iter().any(|prefix| name.starts_with(prefix))
+    crate::ice_filter::is_physical_interface_name(name)
 }
 
 /// Viewer feedback seen on the video sender: retransmission and keyframe requests.
@@ -2015,7 +2018,7 @@ mod network_tests {
     use super::*;
     #[test]
     fn ice_skips_overlay_and_container_interfaces_only() {
-        for name in ["ztfp6jdvog", "docker0", "br-1a2b", "veth12", "virbr0", "lo"] { assert!(!ice_interface_allowed(name), "{name}"); }
+        for name in ["tailscale0", "wg0", "tun0", "utun3", "ztfp6jdvog", "docker0", "br-1a2b", "veth12", "virbr0", "lo"] { assert!(!ice_interface_allowed(name), "{name}"); }
         for name in ["eno1", "enp5s0", "wlp3s0", "eth0"] { assert!(ice_interface_allowed(name), "{name}"); }
     }
     #[test]

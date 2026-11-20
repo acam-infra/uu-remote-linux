@@ -21,8 +21,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=UU_NO_GTK");
     println!("cargo:rustc-check-cfg=cfg(uu_gtk)");
 
+    println!("cargo:rerun-if-env-changed=UU_NO_X11");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "linux" {
+        println!("cargo:rustc-link-arg=-Wl,--as-needed");
+    }
+    let no_x11 = std::env::var_os("UU_NO_X11").is_some();
+    if target_os == "linux" && !no_x11 {
         if std::env::var_os("CARGO_FEATURE_KMS").is_some() {
             println!("cargo:rerun-if-changed=c_engine/kms_engine.c");
             let output=std::process::Command::new("pkg-config").args(["--cflags","libdrm"]).output().expect("KMS requires pkg-config and libdrm development headers");

@@ -12,6 +12,7 @@ mod desktop_session;
 mod desktop_power;
 mod portal;
 mod network_diagnostics;
+mod ice_filter;
 mod session_ice;
 mod wayland;
 mod auth;

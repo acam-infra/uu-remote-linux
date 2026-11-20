@@ -1,6 +1,7 @@
 //! Experimental controller session, built only with --features native-viewer.
 #![allow(dead_code)]
 #[path = "auth.rs"] mod auth;
+#[path = "ice_filter.rs"] mod ice_filter;
 #[path = "config.rs"] mod config;
 #[path = "i18n.rs"] mod i18n;
 #[path = "protocol.rs"] mod protocol;
@@ -15,7 +16,7 @@ use viewer::clipboard;
 #[cfg(test)] #[path="initialization.rs"] mod initialization;
 use viewer::{api::Api,rtc::ReadyPolicy,session::{Options,Session},wire::Shape};
 use std::time::Duration;
-const HELP:&str="Experimental native viewer.\n  uuremote-viewer ui   (GTK window: sign-in, devices, sessions) Desktop UI requires viewer-sdl (decodes with the ffmpeg CLI, or FFmpeg 6.x libraries with viewer-ffmpeg).\n  uuremote-viewer power DEVICE reboot|shutdown\n  uuremote-viewer type DEVICE [options]   (secret from UU_INPUT_ENV or stdin; reuses running viewer)\n    options: --delay-ms MS --omit-last N --snapshot PATH --dry-run --new-session\n  uuremote-viewer unbind DEVICE [--shared]   (从账号删除设备 / remove a device from the account)\n  uuremote-viewer terminal DEVICE [SESSION]\n  uuremote-viewer files DEVICE ls PATH | get REMOTE LOCAL | put LOCAL REMOTE\n  uuremote-viewer portmap DEVICE LOCAL_PORT HOST PORT\n  uuremote-viewer files-ui|portmap-ui|terminal-ui DEVICE NAME   (GTK tool windows)\n  uuremote-viewer login [--no-gui]\n  uuremote-viewer devices METHOD ARRAY_POINTER ID_POINTER NAME_POINTER\n  uuremote-viewer assist CONNECT_ID   (验证码从 stdin 读取一行)\n  uuremote-viewer connect DEVICE true|false SHAPE_JSON echo|manual raw|legacy [--view-only]\nVideo: UU_VIEWER_CODEC=h264 forces H.264; UU_VIEWER_CHROMA=444 requests true color (default 4:2:0).\nAudio: UU_VIEWER_AUDIO=0 disables playback. UU_VIEWER_VIEW_ONLY=1 disables desktop input.\nDevice-list method/JSON pointers and compatibility shape require verified operator configuration.\nQR login reuses the sibling uuremote-server login command. Never run login in a captured log.\nEcho readiness is transport observation only; desktop sessions send one sendVideoTrack RPC (like the official iPhone viewer).";
+const HELP:&str="Experimental native viewer.\n  uuremote-viewer ui   (GTK window: sign-in, devices, sessions) Desktop UI requires viewer-sdl (decodes with the ffmpeg CLI, or FFmpeg 6.x libraries with viewer-ffmpeg).\n  uuremote-viewer power DEVICE reboot|shutdown\n  uuremote-viewer type DEVICE [options]   (secret from UU_INPUT_ENV or stdin; reuses running viewer)\n    options: --delay-ms MS --omit-last N --snapshot PATH --dry-run --new-session\n  uuremote-viewer unbind DEVICE [--shared]   (从账号删除设备 / remove a device from the account)\n  uuremote-viewer terminal DEVICE [SESSION]\n  uuremote-viewer files DEVICE ls PATH | get REMOTE LOCAL | put LOCAL REMOTE\n  uuremote-viewer portmap DEVICE LOCAL_PORT HOST PORT\n  uuremote-viewer portmap --stdio DEVICE HOST PORT   (SSH ProxyCommand stdio bridge)\n  uuremote-viewer files-ui|portmap-ui|terminal-ui DEVICE NAME   (GTK tool windows)\n  uuremote-viewer login [--no-gui]\n  uuremote-viewer devices METHOD ARRAY_POINTER ID_POINTER NAME_POINTER\n  uuremote-viewer assist CONNECT_ID   (验证码从 stdin 读取一行)\n  uuremote-viewer connect DEVICE true|false SHAPE_JSON echo|manual raw|legacy [--view-only]\nVideo: UU_VIEWER_CODEC=h264 forces H.264; UU_VIEWER_CHROMA=444 requests true color (default 4:2:0).\nAudio: UU_VIEWER_AUDIO=0 disables playback. UU_VIEWER_VIEW_ONLY=1 disables desktop input.\nDevice-list method/JSON pointers and compatibility shape require verified operator configuration.\nQR login reuses the sibling uuremote-server login command. Never run login in a captured log.\nEcho readiness is transport observation only; desktop sessions send one sendVideoTrack RPC (like the official iPhone viewer).";
 const DEFAULT_SHAPE:&str=r#"{"capture_type":1,"platform":3,"client_version":"4.42.0","width":1920,"height":1080,"fps":60,"chroma":1,
  "decoders":[{"fps":60,"codec":1,"width":3840,"height":2160,"chroma":1}],"display_modes":[[1920,1080,60]],
  "displays":[{"id":1,"fps":60,"type":0,"hdr":0}],
@@ -257,16 +258,39 @@ mod cli_tests {
 }
 
 async fn tool_command(args:&[String])->Result<(),String>{
-    let capture=match args[0].as_str(){"terminal" if args.len()==2 || args.len()==3=>8,"terminal-ui" if args.len()==3=>8,"files" if (args.len()==4 && args[2]=="ls") || (args.len()==5 && ["get","put"].contains(&args[2].as_str()))=>5,"portmap" if args.len()==5=>9,"files-ui" if args.len()==3=>5,"portmap-ui" if args.len()==3=>9,_=>return Err(HELP.into())};
+    let (is_stdio, portmap_params) = if args[0] == "portmap" {
+        if args.len() == 5 && args[1] == "--stdio" {
+            let port = args[4].parse::<u16>().map_err(|_| "Invalid target port")?;
+            (true, Some((args[2].clone(), 0u16, args[3].clone(), port)))
+        } else if args.len() == 5 && args[2] == "--stdio" {
+            let port = args[4].parse::<u16>().map_err(|_| "Invalid target port")?;
+            (true, Some((args[1].clone(), 0u16, args[3].clone(), port)))
+        } else if args.len() == 5 {
+            let local = args[2].parse::<u16>().map_err(|_| "Invalid local port")?;
+            let port = args[4].parse::<u16>().map_err(|_| "Invalid target port")?;
+            (false, Some((args[1].clone(), local, args[3].clone(), port)))
+        } else {
+            return Err(HELP.into());
+        }
+    } else {
+        (false, None)
+    };
+    let capture=match args[0].as_str(){"terminal" if args.len()==2 || args.len()==3=>8,"terminal-ui" if args.len()==3=>8,"files" if (args.len()==4 && args[2]=="ls") || (args.len()==5 && ["get","put"].contains(&args[2].as_str()))=>5,"portmap" if portmap_params.is_some()=>9,"files-ui" if args.len()==3=>5,"portmap-ui" if args.len()==3=>9,_=>return Err(HELP.into())};
     let terminal_session=if args[0]=="terminal" && args.len()==3{Some(args[2].parse::<u32>().ok().filter(|n|*n!=0).ok_or("Invalid terminal session id")?)}else{None};
     #[cfg(not(uu_gtk))] if args[0].ends_with("-ui"){return Err("Tool windows require the GTK build".into())}
-    let ports=if args[0]=="portmap"{Some((args[2].parse::<u16>().map_err(|_|"Invalid local port")?,args[4].parse::<u16>().map_err(|_|"Invalid target port")?))}else{None};
-    if ports.is_some_and(|(_,port)|port==0) || (args[0]=="portmap" && args[3].trim().is_empty()){return Err("Invalid forwarding target".into())}
+    if let Some((_, _, ref host, port)) = portmap_params {
+        if port == 0 || host.trim().is_empty() { return Err("Invalid forwarding target".into()); }
+    }
     let mut shape:Shape=serde_json::from_str(DEFAULT_SHAPE).map_err(|_|"Invalid built-in tool shape")?;
     shape.capture_type=capture;shape.feature_flag.clear();
     if capture!=5{shape.decoders.clear();shape.display_modes.clear();shape.displays.clear();shape.codecs.clear();}
     let creds=credentials()?;let api=Api::new(auth::UUAuthClient::new(creds.clone()),creds.api_base());
-    let room=api.join(&args[1],false,true).await.map_err(|e|e.to_string())?;
+    let target_dev = if let Some((ref dev, _, _, _)) = portmap_params { dev.as_str() } else { args[1].as_str() };
+    let room = if let Some((id, code)) = target_dev.split_once(':') {
+        api.join_share(id, code).await.map_err(|e| e.to_string())?
+    } else {
+        api.join(target_dev, false, true).await.map_err(|e| e.to_string())?
+    };
     // Match the existing UI connection framing (9bb42d5); the host tolerates this prefix.
     let options=Options{timeout:Duration::from_secs(12),legacy_prefix:true,ready_policy:ReadyPolicy::EchoOnly,clipboard:clipboard::Bridge::new(false)};
     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
@@ -280,7 +304,7 @@ async fn tool_command(args:&[String])->Result<(),String>{
             #[cfg(uu_gtk)] "terminal-ui"=>viewer::tools_ui::terminal(io,rx,&args[1],&args[2]).await,
             #[cfg(uu_gtk)] "files-ui"=>viewer::tools_ui::files(io,rx,&args[2]).await,
             #[cfg(uu_gtk)] "portmap-ui"=>viewer::tools_ui::portmap(io,rx,&args[2]).await,
-            "portmap"=>{let(local,port)=ports.unwrap();viewer::tools::cli::portmap(io,rx,local,&args[3],port).await}
+            "portmap"=>{let(_,local,ref host,port)=portmap_params.unwrap();if is_stdio{viewer::tools::cli::portmap_stdio(io,rx,host,port).await}else{viewer::tools::cli::portmap(io,rx,local,host,port).await}}
             _=>Err("Tool windows require the GTK build".into())}};
         tokio::pin!(operation);
         let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;

@@ -88,3 +88,34 @@ async fn forward(io:&Transport,session:u64,rule:u64,stream:u64,mut socket:TcpStr
         f=rx.recv()=>match f {Some((2,b))=>if socket.write_all(&b).await.is_err(){break}/* local client hung up: a normal close */,Some((1,_))|None=>break,Some((4,_))=>{},_=>return Err("Unexpected forwarding frame".into())},
     }}let _=socket.shutdown().await;Ok(())
 }
+
+pub async fn run_stdio(io:Transport,mut rx:mpsc::Receiver<Packet>,host:&str,port:u16)->Result<(),String>{
+    if host.trim().is_empty() || port==0 {return Err("Invalid forwarding target".into())}
+    let session=1u64;let rule=1u64;let stream=1u64;
+    let (tx,mut stream_rx)=mpsc::channel::<(u64,Vec<u8>)>(64);
+    let worker=tokio::spawn(async move{
+        while let Some((channel,b))=rx.recv().await {
+            if channel!=FILE{continue}
+            let Some(f)=blob(&b,27)else{continue};
+            if uint(f,1)!=session || uint(f,2)!=rule || uint(f,3)!=stream {continue}
+            let kind=uint(f,4);
+            let payload=blob(f,5).unwrap_or_default().to_vec();
+            if tx.send((kind,payload)).await.is_err(){break}
+        }
+    });
+    let syn=serde_json::json!({"version":1,"target_host":host,"target_port":port}).to_string();
+    io.send(FILE,frame(session,rule,stream,0,syn.as_bytes())).await?;
+    let ack=tokio::time::timeout(Duration::from_secs(15),stream_rx.recv()).await.map_err(|_|"Forwarding SYN timeout")?.ok_or("Forwarding channel closed")?;
+    if ack.0!=3 {worker.abort();return Err(format!("Forwarding SYN answered with frame type {}",ack.0))}
+    if serde_json::from_slice::<serde_json::Value>(&ack.1).ok().and_then(|v|v["ok"].as_bool())!=Some(true){worker.abort();return Err("Forwarding target rejected".into())}
+    let mut stdin=tokio::io::stdin();
+    let mut stdout=tokio::io::stdout();
+    let mut buf=vec![0u8;16*1024];
+    loop {tokio::select!{
+        r=stdin.read(&mut buf)=>{let n=match r{Ok(n)=>n,Err(_)=>break};if n==0{break}if io.send(FILE,frame(session,rule,stream,2,&buf[..n])).await.is_err(){break}},
+        f=stream_rx.recv()=>match f {Some((2,b))=>if stdout.write_all(&b).await.is_err()||stdout.flush().await.is_err(){break},Some((1,_))|None=>break,Some((4,_))=>{},_=>{worker.abort();return Err("Unexpected forwarding frame".into())}},
+    }}
+    let _=io.send(FILE,frame(session,rule,stream,1,&[])).await;
+    worker.abort();
+    Ok(())
+}

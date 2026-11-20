@@ -71,3 +71,7 @@ pub async fn portmap(io:Transport,rx:mpsc::Receiver<Packet>,local:u16,host:&str,
     let result=tokio::select!{r=tokio::signal::ctrl_c()=>r.map_err(|_|"Cannot watch interrupt".to_owned()),_=p.closed()=>Err("Forwarding transport closed".into())};
     p.remove_rule(id).await?;result
 }
+
+pub async fn portmap_stdio(io:Transport,rx:mpsc::Receiver<Packet>,host:&str,port:u16)->Result<(),String>{
+    portmap::run_stdio(io,rx,host,port).await
+}

@@ -19,7 +19,7 @@ pub fn configuration(result:&Value)->Result<RTCConfiguration,String> {
         servers.push(RTCIceServer { urls,username:string("username")?,credential:string("credential")?,
             credential_type:webrtc::ice_transport::ice_credential_type::RTCIceCredentialType::Password });
     }
-    let relay=match result.get("force_relay") {None=>false,Some(Value::Bool(b))=>*b,_=>return Err("Invalid relay policy".into())};
+    let relay=match result.get("force_relay") {None=>false,Some(Value::Bool(b))=>*b,_=>return Err("Invalid relay policy".into())} || crate::ice_filter::force_relay_by_env();
     if relay && !servers.iter().any(|s|s.urls.iter().any(|u|u.starts_with("turn:")||u.starts_with("turns:"))) {return Err("Relay-only session without TURN".into())}
     // An empty cloud list means host candidates only. Never invent public STUN.
     Ok(RTCConfiguration{ice_servers:servers,ice_transport_policy:if relay{RTCIceTransportPolicy::Relay}else{RTCIceTransportPolicy::All},..Default::default()})
@@ -69,8 +69,9 @@ fn media_engine(shape:&Shape)->Result<MediaEngine,String>{
     }Ok(engine)
 }
 impl Peer {
-    pub async fn new(config:RTCConfiguration, shape:&Shape, app_id:&str, ice_id:&str, remote_client:&str, outbound:mpsc::Sender<Value>, settings:SettingEngine, mut clipboard:super::clipboard::Bridge)->Result<Self,String> {
+    pub async fn new(config:RTCConfiguration, shape:&Shape, app_id:&str, ice_id:&str, remote_client:&str, outbound:mpsc::Sender<Value>, mut settings:SettingEngine, mut clipboard:super::clipboard::Bridge)->Result<Self,String> {
         shape.validate_session()?;
+        crate::ice_filter::apply_setting_engine(&mut settings);
         let mut engine=media_engine(shape)?;
         // UU RTP metadata the official Mac viewer offers (src/rtp_metadata.rs on the host side).
         for uri in ["http://www.webrtc.org/experiments/rtp-hdrext/video-capture-index","http://www.webrtc.org/experiments/rtp-hdrext/video-frame-is-new-frame"] {
@@ -295,6 +296,10 @@ impl Peer {
                 let candidate=if let Some(s)=value.as_str() {
                     RTCIceCandidateInit {candidate:s.into(),sdp_mid:body.get("sdp_mid").and_then(Value::as_str).map(str::to_owned),sdp_mline_index:body.get("sdp_mline_index").and_then(Value::as_u64).and_then(|v|u16::try_from(v).ok()),..Default::default()}
                 } else {serde_json::from_value(value.clone()).map_err(|_|"Invalid candidate")?};
+                if !crate::ice_filter::remote_candidate_allowed(&candidate.candidate) {
+                    log::info!("Viewer skipping remote overlay host ICE candidate");
+                    return Ok(());
+                }
                 if self.answered {self.pc.add_ice_candidate(candidate).await.map_err(|_|"ICE candidate failed")?;}
                 else {if self.early.len()>=256{return Err("Too many early ICE candidates".into())}self.early.push(candidate);}
             }

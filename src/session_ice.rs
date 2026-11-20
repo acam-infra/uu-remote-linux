@@ -26,7 +26,7 @@ impl SessionIce {
     pub fn from_header(header:&Value)->Self {
         let data=header.get("data").unwrap_or(header);
         let field=|name:&str|header.get(name).or_else(||data.get(name));
-        let mut result=Self { relay_only:field("force_relay").and_then(Value::as_bool).unwrap_or(false),..Default::default() };
+        let mut result=Self { relay_only:field("force_relay").and_then(Value::as_bool).unwrap_or(false) || crate::ice_filter::force_relay_by_env(),..Default::default() };
         if let Some(servers)=field("iceServers").and_then(Value::as_array) {
             for server in servers.iter().take(16) {
                 let urls=server.get("urls").or_else(||server.get("url"));
