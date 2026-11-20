@@ -13,7 +13,7 @@ pub fn varint(mut n: u64, out: &mut Vec<u8>) { while n >= 128 { out.push(n as u8
 pub fn int(field: u32, value: u64, out: &mut Vec<u8>) { varint(u64::from(field) << 3,out); varint(value,out); }
 pub fn bytes(field: u32, value: &[u8], out: &mut Vec<u8>) { varint((u64::from(field)<<3)|2,out); varint(value.len() as u64,out); out.extend(value); }
 pub fn envelope(seq:u64, kind:u32, payload:&[u8]) -> Vec<u8> {
-    let mut out=Vec::new(); int(1,seq,&mut out); bytes(kind,payload,&mut out); out
+    let mut out=Vec::with_capacity(payload.len()+24); int(1,seq,&mut out); bytes(kind,payload,&mut out); out
 }
 #[derive(Clone, Deserialize)]
 pub struct Decoder { pub fps:u32, pub codec:u32, pub width:u32, pub height:u32, pub chroma:u32 }

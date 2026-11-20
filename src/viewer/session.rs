@@ -32,7 +32,7 @@ impl Session {
             let ice=result.get("ice_id").and_then(Value::as_str).filter(|s|!s.is_empty()&&s.len()<=128).map(str::to_owned).unwrap_or(ice);
             let remote=result.get("client_id").and_then(Value::as_str).filter(|s|!s.is_empty()).ok_or("Control acknowledgement missing peer route")?;
             let config=rtc::configuration(&result)?;
-            let(tx,rx)=mpsc::channel(256);
+            let(tx,rx)=mpsc::channel(2048);
             let peer=Peer::new(config,&shape,&app,&ice,remote,tx,settings,options.clipboard).await?;
             // The official host drops an offer whose ice_id is not yet in its connection table
             // (libstreamer 0xc3080); give it time to process be-controlled first.

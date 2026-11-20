@@ -453,7 +453,7 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         let WireValue::Bytes(flags)=decode_wire(&options).unwrap().into_iter().find(|f|f.number==11).unwrap().value else{panic!()};
         assert!(decode_wire(flags).unwrap().iter().any(|f|f.number==8 && f.value==WireValue::Varint(3)));
     }
-    #[tokio::test] async fn backend_uses_stdin_preserves_text_and_bounds_reads(){
+    #[cfg(unix)] #[tokio::test] async fn backend_uses_stdin_preserves_text_and_bounds_reads(){
         use std::os::unix::fs::PermissionsExt;
         let root=std::env::temp_dir().join(format!("uu-clipboard-mock-{}",wire::uuid()));std::fs::create_dir(&root).unwrap();
         let script=root.join("mock");

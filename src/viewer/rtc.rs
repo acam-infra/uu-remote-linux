@@ -251,7 +251,7 @@ impl Peer {
                     let wanted=index==3 || index==4 || route==3 || (index==0 && has(&[22]));
                     let sender=inbox.lock().unwrap().clone();
                     if let (true,Some(sender))=(wanted,sender) {
-                        if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_))=sender.try_send((route,message.data.to_vec())) {
+                        if sender.send((route,message.data.to_vec())).await.is_err() {
                             let mut slot=inbox.lock().unwrap();if slot.as_ref().is_some_and(|s|s.same_channel(&sender)){slot.take();}
                         }
                     }

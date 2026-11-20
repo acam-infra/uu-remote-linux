@@ -17,12 +17,14 @@ fn host_files()->(files::Files,mpsc::Receiver<files::Progress>,tokio::task::Join
 #[test]
 fn terminal_frames_match_host_and_incremental_decoder(){
     let a=terminal::encode(terminal::OPEN,7,br#"{"cols":80,"rows":24}"#);
+    #[cfg(unix)]
     assert_eq!(a,crate::terminal::encode(crate::terminal::OPEN,7,br#"{"cols":80,"rows":24}"#));
     let mut d=terminal::Decoder::default();let b=[a.clone(),terminal::encode(terminal::STDOUT,7,b"synthetic")].concat();let mut frames=Vec::new();
     for part in b.chunks(3){frames.extend(d.push(part).unwrap());}assert_eq!(frames.len(),2);assert_eq!(frames[1].payload,b"synthetic");
     assert!(terminal::Decoder::default().push(b"TERM\x02\x01\0\0\0\0\0\0\0\0\0\0").is_err());
     let mut bad=a;bad[12..16].copy_from_slice(&u32::MAX.to_le_bytes());assert!(terminal::Decoder::default().push(&bad).is_err());
 }
+#[cfg(unix)]
 #[tokio::test]
 async fn terminal_rpc_list_open_io_and_errors(){
     let(io,rx,input,mut out)=pair();let(t,mut events)=terminal::Terminal::new(io,rx);
@@ -85,7 +87,7 @@ async fn forwarding_mock_loopback_echo_fragmentation_remove_and_reject(){
                 0=>{let v:serde_json::Value=serde_json::from_slice(blob(f,5).unwrap()).unwrap();assert_eq!(v["version"],1);let target=v["target_port"].as_u64().unwrap()as u16;
                     let connected=if target==port {tokio::net::TcpStream::connect(("127.0.0.1",target)).await.ok()}else{None};let ok=connected.is_some();tcp=connected;
                     input.send((FILE,portmap::frame(s,r,t,3,if ok{br#"{"version":1,"ok":true}"#}else{br#"{"version":1,"ok":false}"#}))).await.unwrap();},
-                2=>{let payload=blob(f,5).unwrap();assert!(payload.len()<=16*1024);let socket=tcp.as_mut().unwrap();socket.write_all(payload).await.unwrap();let mut b=vec![0;payload.len()];socket.read_exact(&mut b).await.unwrap();input.send((FILE,portmap::frame(s,r,t,2,&b))).await.unwrap();},
+                2=>{let payload=blob(f,5).unwrap();assert!(payload.len()<=portmap::PORTMAP_CHUNK);let socket=tcp.as_mut().unwrap();socket.write_all(payload).await.unwrap();let mut b=vec![0;payload.len()];socket.read_exact(&mut b).await.unwrap();input.send((FILE,portmap::frame(s,r,t,2,&b))).await.unwrap();},
                 1=>{tcp.take();},_=>panic!(),
             }
         }
@@ -159,6 +161,7 @@ fn terminal_metadata_is_allowlisted_and_sorted(){
     assert_eq!(rows,format!("2\t/bin/bash\t0\t{}\n9\t/bin/sh X Y \t123\t{}\n",crate::i18n::s("运行中","Running"),crate::i18n::s("已分离","Detached")));
     assert!(!rows.contains("PRIVATE"));assert!(terminal::session_rows(&[]).is_empty());
 }
+#[cfg(unix)]
 #[tokio::test]
 async fn terminal_attach_uses_existing_id_and_rejects_absent_session(){
     let(io,rx,input,mut out)=pair();let(t,_events)=terminal::Terminal::new(io,rx);
@@ -180,6 +183,7 @@ async fn terminal_attach_uses_existing_id_and_rejects_absent_session(){
     assert!(t.attach(99,90,30).await.is_err());assert!(t.attach(0,90,30).await.is_err());host.await.unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn terminal_kill_acknowledgement_and_empty_refresh(){
     let(io,rx,input,mut out)=pair();let(t,_events)=terminal::Terminal::new(io,rx);

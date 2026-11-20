@@ -28,7 +28,7 @@ const SYN_ACK: u64 = 3;
 const DATA_ACK: u64 = 4;
 const PROTOCOL_VERSION: u64 = 1;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const READ_CHUNK: usize = 16 * 1024;
+const READ_CHUNK: usize = 32 * 1024;
 /// Pending writes to one target before the stream is closed ("写缓冲超限").
 const WRITE_QUEUE_FRAMES: usize = 256;
 /// Pause reading targets while this much is queued on the data channel.
@@ -65,7 +65,7 @@ fn bytes(number: u32, v: &[u8], out: &mut Vec<u8>) { varint(u64::from(number) <<
 struct Key { session: Id, rule: Id, stream: Id }
 
 fn frame(key: &Key, kind: u64, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(payload.len() + 48);
     key.session.encode(1, &mut out);
     key.rule.encode(2, &mut out);
     key.stream.encode(3, &mut out);
@@ -99,7 +99,7 @@ pub struct Session {
 impl Session {
     /// `channel` is the peer's FILE_DATA_CHANNEL slot (filled once the viewer opens it).
     pub fn new(channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>, sequence: Arc<AtomicU64>) -> Arc<Self> {
-        let (outbound, mut queue) = mpsc::channel::<(Key, u64, Vec<u8>)>(64);
+        let (outbound, mut queue) = mpsc::channel::<(Key, u64, Vec<u8>)>(256);
         tokio::spawn(async move {
             while let Some((key, kind, payload)) = queue.recv().await {
                 let mut slot = channel.lock().unwrap().clone();

@@ -11,7 +11,7 @@ mod viewer;
 use viewer::clipboard;
 #[path="clipboard_protocol.rs"] mod clipboard_protocol;
 #[path="clipboard_rich.rs"] mod clipboard_rich;
-#[cfg(test)] #[path="terminal.rs"] mod terminal;
+#[cfg(all(test, unix))] #[path="terminal.rs"] mod terminal;
 #[cfg(test)] #[path="file_trans.rs"] mod file_trans;
 #[cfg(test)] #[path="initialization.rs"] mod initialization;
 use viewer::{api::Api,rtc::ReadyPolicy,session::{Options,Session},wire::Shape};
@@ -35,8 +35,14 @@ async fn run(args:&[String])->Result<(),String> {
     match args.first().map(String::as_str) {
         None|Some("--help"|"help")=>{println!("{HELP}");Ok(())},
         Some("login") if args.len()==1 || (args.len()==2 && args[1]=="--no-gui")=> {
-            let executable=std::env::current_exe().map_err(|_|"Cannot locate companion login binary")?.with_file_name("uuremote-server");
-            login_command(&executable,&args[1..]).await
+            #[cfg(target_os = "linux")]
+            {
+                let executable=std::env::current_exe().map_err(|_|"Cannot locate companion login binary")?.with_file_name("uuremote-server");
+                if executable.exists() {
+                    return login_command(&executable,&args[1..]).await;
+                }
+            }
+            standalone_qr_login().await
         }
         #[cfg(uu_gtk)]
         Some("ui") if args.len()==1=> viewer::ui::run(credentials).await,
@@ -209,6 +215,130 @@ async fn type_command(args:&[String])->Result<(),String>{
 
 fn credentials()->Result<auth::Credentials,String> {auth::Credentials::load(config::read_fresh().map_err(|_|"Cannot read credential configuration")?.as_ref())}
 fn api()->Result<Api,String> {let creds=credentials()?;Ok(Api::new(auth::UUAuthClient::new(creds.clone()),creds.api_base()))}
+
+
+fn write_viewer_config(cfg: &serde_json::Value) -> Result<std::path::PathBuf, String> {
+    let path = config::path();
+    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
+    let tmp = path.with_extension("json.tmp");
+    let data = serde_json::to_vec_pretty(cfg).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+fn csrf_from_jwt(token: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    v.get("csrf").and_then(|c| c.as_str()).filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
+async fn standalone_qr_login() -> Result<(), String> {
+    let mut cfg = config::file()?.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let get = |cfg: &serde_json::Value, k: &str| {
+        std::env::var(format!("UU_{}", k.to_uppercase())).ok().filter(|v| !v.is_empty())
+            .or_else(|| cfg.get(k).and_then(|v| v.as_str()).map(str::to_owned)).unwrap_or_default()
+    };
+    let sign_key = Some(get(&cfg, "sign_key")).filter(|k| !k.is_empty()).unwrap_or_else(|| auth::DEFAULT_SIGN_KEY.into());
+    if get(&cfg, "client_id").is_empty() { cfg["client_id"] = serde_json::json!(viewer::wire::uuid()); }
+    if get(&cfg, "system_id").is_empty() { cfg["system_id"] = serde_json::json!(viewer::wire::uuid().to_uppercase()); }
+    if get(&cfg, "machine_guid").is_empty() { cfg["machine_guid"] = serde_json::json!(viewer::wire::uuid().to_uppercase()); }
+    let mut creds = auth::Credentials {
+        client_id: get(&cfg, "client_id"),
+        system_id: get(&cfg, "system_id"),
+        device_id: get(&cfg, "device_id"),
+        sign_key,
+        base_url: config::custom_base_url_in(Some(&cfg)).map_err(|e| e.to_string())?,
+        ..Default::default()
+    };
+    write_viewer_config(&cfg)?;
+    if creds.device_id.is_empty() {
+        let host = std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| format!("{}-cli", std::env::consts::OS));
+        let os_label = match std::env::consts::OS {
+            "windows" => format!("Windows {}", std::env::consts::ARCH),
+            "macos" => format!("macOS {}", std::env::consts::ARCH),
+            other => format!("{other} {}", std::env::consts::ARCH),
+        };
+        let body = serde_json::json!({
+            "name": host,
+            "client_id": creds.client_id,
+            "system_id": creds.system_id,
+            "machine_guid": get(&cfg, "machine_guid"),
+            "os": os_label,
+            "base_board": "Generic",
+            "cpu": std::env::consts::ARCH,
+            "video": ["Unknown"],
+            "mac": "",
+            "memory": 8192,
+            "screen": "1920x1080",
+        });
+        let (status, resp) = auth::UUAuthClient::new(creds.clone()).post_json("/api/v1/device/windows/init", &body).await?;
+        let id = resp.get("data").and_then(|d| d.get("device_id")).and_then(|v| v.as_str())
+            .ok_or_else(|| format!("device init failed (status={status})"))?;
+        cfg["device_id"] = serde_json::json!(id);
+        creds.device_id = id.to_string();
+        write_viewer_config(&cfg)?;
+    }
+    let client = auth::UUAuthClient::new(creds.clone());
+    let timeout = Duration::from_secs(60);
+    loop {
+        let (status, resp) = client.post_with_timeout("/api/v1/qrcode/gen/login", None, timeout).await.map_err(|e| format!("QR generation failed: {e}"))?;
+        let ok = status == 200 && matches!(resp.get("code").and_then(|c| c.as_i64()), Some(0 | 200));
+        let d = resp.get("data").filter(|_| ok)
+            .ok_or_else(|| format!("QR generation rejected (http={status})"))?;
+        let url = d.get("qrcode_jump_url").and_then(|v| v.as_str()).ok_or("qrcode gen returned no qrcode_jump_url")?.to_string();
+        let ticket = d.get("status_query_ticket").or_else(|| d.get("token")).and_then(|v| v.as_str()).ok_or("qrcode gen returned no status ticket")?.to_string();
+        let qr = qrcode::QrCode::new(url.as_bytes()).map_err(|e| e.to_string())?
+            .render::<qrcode::render::unicode::Dense1x2>().quiet_zone(true).build();
+        println!("
+Scan with the UU Remote mobile app (网易UU远程 App 扫码登录):
+{qr}");
+        let mut login_status = 1i64;
+        loop {
+            let query = serde_json::json!({"token": ticket, "qrcode_jump_url": url, "login_status": login_status});
+            let (st_http, st_resp) = client.post_with_timeout("/api/v1/qrcode/login/status", Some(&query), timeout).await.map_err(|e| format!("QR status query failed: {e}"))?;
+            if st_http != 200 || !matches!(st_resp.get("code").and_then(|c| c.as_i64()), Some(0 | 200)) {
+                return Err(format!("QR status query rejected (http={st_http})"));
+            }
+            let st = st_resp.get("data").and_then(|d| d.get("status")).and_then(|v| v.as_i64()).unwrap_or(1);
+            match st {
+                1 => { login_status = 1; }
+                2 => { if login_status != 2 { println!("已扫码，请在手机上确认 (scanned, confirm on the phone)"); } login_status = 2; }
+                3 => { println!("QR code expired; generating a new one"); break; }
+                0 => { tokio::time::sleep(Duration::from_millis(350)).await; break; }
+                4 => {
+                    println!("已确认，正在完成登录 (confirmed, completing login)");
+                    let body = serde_json::json!({"token": ticket, "qrcode_jump_url": url});
+                    let (ex_http, ex_resp) = client.post_with_timeout("/api/v1/login/by_qrcode", Some(&body), timeout).await.map_err(|e| format!("QR login exchange failed: {e}"))?;
+                    let ex_ok = ex_http == 200 && matches!(ex_resp.get("code").and_then(|c| c.as_i64()), Some(0 | 200));
+                    let ex_d = ex_resp.get("data").filter(|_| ex_ok)
+                        .ok_or_else(|| format!("QR login exchange rejected (http={ex_http})"))?;
+                    let token = ex_d.get("token").and_then(|v| v.as_str()).ok_or("login returned no token")?;
+                    let user = ex_d.get("user_id").and_then(|v| v.as_str()).ok_or("login returned no user_id")?;
+                    cfg["token"] = serde_json::json!(token);
+                    cfg["user_id"] = serde_json::json!(user);
+                    cfg["csrf"] = serde_json::json!(csrf_from_jwt(token).ok_or("token carries no csrf claim")?);
+                    let nickname = ex_d.get("nickname").and_then(|v| v.as_str()).unwrap_or("");
+                    if !nickname.is_empty() { cfg["account_name"] = serde_json::json!(nickname); }
+                    cfg["base_url"] = serde_json::json!(creds.base_url);
+                    let saved = write_viewer_config(&cfg)?;
+                    println!("Logged in as {} ({}); saved to {}", nickname, user, saved.display());
+                    return Ok(());
+                }
+                other => return Err(format!("Unexpected QR status: {other}")),
+            }
+        }
+    }
+}
 
 async fn login_command(executable:&std::path::Path,options:&[String])->Result<(),String> {
     let status=tokio::process::Command::new(executable).arg("login").args(options).status().await.map_err(|_|"Build sibling uuremote-server to reuse QR login")?;
