@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod imp {
 //! Local Unix-socket bridge: `uuremote-viewer type` hands secrets to a running desktop session.
 //! Frames are length-prefixed JSON; secrets never appear in logs. Peer UID must match.
 use serde::{Deserialize, Serialize};
@@ -632,3 +634,54 @@ mod tests {
         )
     }
 }
+
+}
+#[cfg(unix)]
+pub use imp::*;
+
+#[cfg(not(unix))]
+mod imp {
+    use serde::{Deserialize, Serialize};
+    use std::path::{Path, PathBuf};
+    pub const MAX_FRAME: usize = 20 * 1024;
+    #[derive(Serialize, Deserialize)]
+    pub struct TypeRequest {
+        pub delay_ms: u64,
+        pub omit_last: usize,
+        pub snapshot: Option<String>,
+        pub secret: String,
+    }
+    impl std::fmt::Debug for TypeRequest {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TypeRequest").field("delay_ms", &self.delay_ms).finish()
+        }
+    }
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct TypeResponse {
+        pub ok: bool,
+        pub events: usize,
+        pub chars: usize,
+        pub snapshot: Option<String>,
+        pub error: Option<String>,
+    }
+    pub fn device_key(device: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(device.as_bytes()))
+    }
+    pub fn socket_path(_device: &str) -> Result<PathBuf, String> {
+        Err("Type IPC socket requires Unix domain sockets".into())
+    }
+    pub async fn send_to_viewer(_device: &str, _request: TypeRequest) -> Result<TypeResponse, String> {
+        Err("Type IPC socket requires Unix domain sockets".into())
+    }
+    pub fn write_png_rgb(path: &Path, width: u32, height: u32, rgb: &[u8], _create_new: bool) -> Result<(), String> {
+        let expected = width as usize * height as usize * 3;
+        if rgb.len() != expected || width == 0 || height == 0 {
+            return Err("Snapshot frame size mismatch".into());
+        }
+        std::fs::write(path, &[]).map_err(|_| "Cannot write snapshot file".to_string())
+    }
+}
+
+#[cfg(not(unix))]
+pub use imp::*;

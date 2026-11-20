@@ -15,7 +15,7 @@ pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
 pub fn path() -> PathBuf {
     if let Some(p) = std::env::var_os("UU_CONFIG") { return PathBuf::from(p); }
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))).or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("uuremote/config.json")
 }

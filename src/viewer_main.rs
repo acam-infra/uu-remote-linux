@@ -246,6 +246,7 @@ mod cli_tests {
         std::env::remove_var("UU_INPUT_ENV");
         std::env::remove_var("UU_TYPE_SENTINEL_ENV");
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn login_reuses_companion_subcommand_with_a_local_process_mock() {
         use std::os::unix::fs::PermissionsExt;
@@ -307,8 +308,13 @@ async fn tool_command(args:&[String])->Result<(),String>{
             "portmap"=>{let(_,local,ref host,port)=portmap_params.unwrap();if is_stdio{viewer::tools::cli::portmap_stdio(io,rx,host,port).await}else{viewer::tools::cli::portmap(io,rx,local,host,port).await}}
             _=>Err("Tool windows require the GTK build".into())}};
         tokio::pin!(operation);
+        #[cfg(unix)]
         let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
-        loop{tokio::select!{r=&mut operation=>break r,r=session.step()=>r?,_=terminate.recv()=>break Ok(()),_=tokio::signal::ctrl_c()=>break Ok(())}}
+        #[cfg(unix)]
+        let res = loop{tokio::select!{r=&mut operation=>break r,r=session.step()=>r?,_=terminate.recv()=>break Ok(()),_=tokio::signal::ctrl_c()=>break Ok(())}};
+        #[cfg(not(unix))]
+        let res = loop{tokio::select!{r=&mut operation=>break r,r=session.step()=>r?,_=tokio::signal::ctrl_c()=>break Ok(())}};
+        res
     }.await;
     session.close().await;result
 }

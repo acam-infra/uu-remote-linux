@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod imp {
 //! Local TTY clients share the list process's Terminal; no cloud credentials cross IPC.
 use super::{terminal::{Terminal,Event},cli};
 use std::{path::{Path,PathBuf},sync::Arc};
@@ -149,4 +151,13 @@ pub async fn client(path:&Path,session:Option<u32>)->Result<(),String>{
         assert!(matches!(read(&mut b).await,Ok(Message::Input(v))if v==[0,255,27]));
         a.write_u32(30).await.unwrap();drop(a);assert!(read(&mut b).await.is_err());
     }
+}
+
+}
+#[cfg(unix)]
+pub use imp::*;
+
+#[cfg(not(unix))]
+pub async fn client(_path: &std::path::Path, _session: Option<u32>) -> Result<(), String> {
+    Err("Local terminal IPC requires Unix domain sockets".into())
 }

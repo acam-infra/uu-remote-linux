@@ -1798,6 +1798,7 @@ impl WebRtcSession {
         }
         flush(&current, &mut names, &mut sections);
         log::info!("Offer SDP structure: {}", sections.join(" | "));
+        let sdp_str = crate::ice_filter::sanitize_remote_sdp(&sdp_str);
         let offer = RTCSessionDescription::offer(sdp_str)
             .map_err(|e| format!("Invalid offer: {}", e))?;
 

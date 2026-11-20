@@ -1,8 +1,12 @@
 //! Command-line adapters; terminal output is intentional user output, never a log.
 use super::*;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use tokio::io::AsyncWriteExt;
+#[cfg(unix)]
 struct Tty {fd:i32,saved:libc::termios}
+#[cfg(unix)]
 impl Tty {
     fn raw()->Result<Self,String>{
         let fd=std::io::stdin().as_raw_fd();let mut saved=unsafe{std::mem::zeroed()};
@@ -11,13 +15,47 @@ impl Tty {
         if unsafe{libc::tcsetattr(fd,libc::TCSANOW,&raw)}!=0{return Err("Cannot set terminal raw mode".into())}Ok(Self{fd,saved})
     }
 }
+#[cfg(unix)]
 impl Drop for Tty {fn drop(&mut self){unsafe{libc::tcsetattr(self.fd,libc::TCSANOW,&self.saved);}}}
+
+#[cfg(unix)]
 pub fn size()->(u16,u16){let mut w:libc::winsize=unsafe{std::mem::zeroed()};if unsafe{libc::ioctl(0,libc::TIOCGWINSZ as _,&mut w)}==0{(w.ws_col.max(1),w.ws_row.max(1))}else{(80,24)}}
+#[cfg(not(unix))]
+pub fn size()->(u16,u16){(120,40)}
+
 pub async fn terminal(io:Transport,rx:mpsc::Receiver<Packet>,session:Option<u32>)->Result<(),String>{
     let(t,output)=terminal::Terminal::new(io,rx);t.check_env().await?;
     let(c,r)=size();let id=match session{Some(id)=>t.attach(id,c,r).await?,None=>t.open(c,r).await?};
     let result=terminal_loop(&t,output,id).await;let _=t.close(id).await;result
 }
+
+pub async fn exec_command(io:Transport,rx:mpsc::Receiver<Packet>,cmd:&[String])->Result<(),String>{
+    let command_line=cmd.join(" ");
+    if command_line.trim().is_empty(){return Err("exec requires a non-empty command".into())}
+    let(t,mut output)=terminal::Terminal::new(io,rx);t.check_env().await?;
+    let id=t.open(120,40).await?;
+    let payload=format!("{command_line}; exit $?\n");
+    t.write(id,payload.as_bytes()).await?;
+    let mut stdout=tokio::io::stdout();
+    let result=loop{tokio::select!{
+        _=tokio::signal::ctrl_c()=>break Ok(()),
+        e=output.recv()=>match e{
+            Some(terminal::Event::Output{session,data})if session==id=>{
+                stdout.write_all(&data).await.map_err(|_|"stdout write failed")?;
+                stdout.flush().await.map_err(|_|"stdout flush failed")?;
+            }
+            Some(terminal::Event::Exit{session,code})if session==id=>{
+                if code!=0{break Err(format!("Remote shell exited with code {code}"))}
+                break Ok(())
+            }
+            Some(terminal::Event::Error{..})|None=>break Err("Terminal session failed".into()),
+            _=>{}
+        }
+    }};
+    let _=t.close(id).await;
+    result
+}
+
 #[async_trait::async_trait]
 pub trait TerminalInput:Sync {
     async fn write(&self,id:u32,data:&[u8])->Result<(),String>;
@@ -28,30 +66,62 @@ impl TerminalInput for terminal::Terminal {
     async fn write(&self,id:u32,data:&[u8])->Result<(),String>{self.write(id,data).await}
     async fn resize(&self,id:u32,cols:u16,rows:u16)->Result<(),String>{self.resize(id,cols,rows).await}
 }
+
+async fn terminal_pipe_loop(t:&impl TerminalInput,mut output:mpsc::Receiver<terminal::Event>,id:u32)->Result<(),String>{
+    let mut stdin=tokio::io::stdin();
+    let mut stdout=tokio::io::stdout();
+    let mut buf=vec![0u8;16*1024];
+    let mut stdin_eof=false;
+    loop{tokio::select!{
+        _=tokio::signal::ctrl_c()=>break,
+        r=stdin.read(&mut buf),if !stdin_eof=>{
+            let n=r.map_err(|_|"stdin read failed")?;
+            if n==0{stdin_eof=true;}else{t.write(id,&buf[..n]).await?;}
+        },
+        e=output.recv()=>match e{
+            Some(terminal::Event::Output{session,data})if session==id=>{stdout.write_all(&data).await.map_err(|_|"stdout write failed")?;stdout.flush().await.map_err(|_|"stdout flush failed")?;},
+            Some(terminal::Event::Exit{session,code})if session==id=>{if code!=0{return Err(format!("Remote shell exited with code {code}"))}break},
+            Some(terminal::Event::Error{..})|None=>return Err("Terminal session failed".into()),_=>{},
+        }
+    }}
+    Ok(())
+}
+
+#[cfg(unix)]
 pub async fn terminal_loop(t:&impl TerminalInput,mut output:mpsc::Receiver<terminal::Event>,id:u32)->Result<(),String>{
     async{
-        let _tty=Tty::raw()?;
-        use std::os::unix::fs::OpenOptionsExt;
-        let input=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open("/dev/tty").map_err(|_|"Cannot open local TTY")?;
-        let input=tokio::io::unix::AsyncFd::new(input).map_err(|_|"Cannot watch local TTY")?;let mut stdout=tokio::io::stdout();let mut buf=vec![0;16*1024];
-        let mut resize=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).map_err(|_|"Cannot watch terminal size")?;
-        let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
-        loop{tokio::select!{
-            _=terminate.recv()=>break,
-            n=async {
-                loop {let mut ready=input.readable().await?;
-                    match ready.try_io(|fd|std::io::Read::read(&mut fd.get_ref(),&mut buf)){Ok(n)=>break n,Err(_)=>continue}
+        if let Ok(_tty)=Tty::raw() {
+            use std::os::unix::fs::OpenOptionsExt;
+            let input=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open("/dev/tty").map_err(|_|"Cannot open local TTY")?;
+            let input=tokio::io::unix::AsyncFd::new(input).map_err(|_|"Cannot watch local TTY")?;let mut stdout=tokio::io::stdout();let mut buf=vec![0;16*1024];
+            let mut resize=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).map_err(|_|"Cannot watch terminal size")?;
+            let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
+            loop{tokio::select!{
+                _=terminate.recv()=>break,
+                n=async {
+                    loop {let mut ready=input.readable().await?;
+                        match ready.try_io(|fd|std::io::Read::read(&mut fd.get_ref(),&mut buf)){Ok(n)=>break n,Err(_)=>continue}
+                    }
+                }=>{let n=n.map_err(|_|"TTY read failed")?;if n==0{break}t.write(id,&buf[..n]).await?;},
+                _=resize.recv()=>{let(c,r)=size();t.resize(id,c,r).await?;},
+                e=output.recv()=>match e{
+                    Some(terminal::Event::Output{session,data})if session==id=>{stdout.write_all(&data).await.map_err(|_|"TTY write failed")?;stdout.flush().await.map_err(|_|"TTY flush failed")?;},
+                    Some(terminal::Event::Exit{session,code})if session==id=>{if code!=0{return Err(format!("Remote shell exited with code {code}"))}break},
+                    Some(terminal::Event::Error{..})|None=>return Err("Terminal session failed".into()),_=>{},
                 }
-            }=>{let n=n.map_err(|_|"TTY read failed")?;if n==0{break}t.write(id,&buf[..n]).await?;},
-            _=resize.recv()=>{let(c,r)=size();t.resize(id,c,r).await?;},
-            e=output.recv()=>match e{
-                Some(terminal::Event::Output{session,data})if session==id=>{stdout.write_all(&data).await.map_err(|_|"TTY write failed")?;stdout.flush().await.map_err(|_|"TTY flush failed")?;},
-                Some(terminal::Event::Exit{session,code})if session==id=>{if code!=0{return Err(format!("Remote shell exited with code {code}"))}break},
-                Some(terminal::Event::Error{..})|None=>return Err("Terminal session failed".into()),_=>{},
-            }
-        }}Ok(())
+            }}
+            Ok(())
+        } else {
+            terminal_pipe_loop(t,output,id).await
+        }
     }.await
 }
+
+#[cfg(not(unix))]
+pub async fn terminal_loop(t:&impl TerminalInput,output:mpsc::Receiver<terminal::Event>,id:u32)->Result<(),String>{
+    terminal_pipe_loop(t,output,id).await
+}
+
 pub async fn files(io:Transport,rx:mpsc::Receiver<Packet>,args:&[String])->Result<(),String>{
     let(f,mut progress)=files::Files::new(io,rx);
     let reporter=tokio::spawn(async move{while let Some(p)=progress.recv().await{eprintln!("{} / {} bytes",p.transferred,p.total);}});

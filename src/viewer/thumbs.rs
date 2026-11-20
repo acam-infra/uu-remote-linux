@@ -35,9 +35,14 @@ pub fn save(device: &str, frame: &super::desktop::Frame) -> Result<(), String> {
     if !enabled() { return Ok(()) }
     let path = path(device).ok_or("No cache directory")?;
     let dir = path.parent().ok_or("No cache directory")?;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|_| "Cannot create the thumbnail directory")?;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    #[cfg(unix)] {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|_| "Cannot create the thumbnail directory")?;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))] {
+        std::fs::create_dir_all(dir).map_err(|_| "Cannot create the thumbnail directory")?;
+    }
     let content = super::input::content_rect((frame.width, frame.height), frame.content.unwrap_or((frame.width, frame.height)))
         .map_or((0, 0, frame.width, frame.height), |(x, y, w, h)| (x as u32, y as u32, w as u32, h as u32));
     let (w, h, rgb) = downscale(frame.width, frame.height, &frame.rgb, content, 640);

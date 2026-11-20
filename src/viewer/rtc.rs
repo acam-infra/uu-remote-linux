@@ -285,7 +285,7 @@ impl Peer {
         match body.get("type").and_then(Value::as_str) {
             Some("answer")=> {
                 if self.answered {return Ok(())}
-                let sdp=answer_sdp(body)?;
+                let sdp=crate::ice_filter::sanitize_remote_sdp(&answer_sdp(body)?);
                 let answer=RTCSessionDescription::answer(sdp).map_err(|_|"Invalid answer")?;
                 self.pc.set_remote_description(answer).await.map_err(|_|"Set remote answer failed")?;
                 self.answered=true;

@@ -5,7 +5,7 @@ use tokio::{net::{TcpListener,TcpStream},io::{AsyncReadExt,AsyncWriteExt},sync::
 #[derive(Clone,Debug)]
 pub struct Status {pub id:u64,pub name:String,pub local_port:u16,pub streams:usize,pub failures:u64}
 struct Rule {status:Arc<Mutex<Status>>,stop:watch::Sender<bool>,task:tokio::task::JoinHandle<()>}
-type Routes=Arc<Mutex<HashMap<(u64,u64),mpsc::Sender<(u64,Vec<u8>)>>>>;
+type Routes=Arc<Mutex<HashMap<(u64,u64),mpsc::UnboundedSender<(u64,Vec<u8>)>>>>;
 pub struct PortMap {io:Transport,session:u64,next:Arc<AtomicU64>,routes:Routes,rules:Mutex<HashMap<u64,Rule>>,alive:watch::Receiver<()>,worker:tokio::task::JoinHandle<()>}
 pub fn frame(session:u64,rule:u64,stream:u64,kind:u64,payload:&[u8])->Vec<u8>{let mut b=ints(&[(1,session),(2,rule),(3,stream),(4,kind)]);wire::bytes(5,payload,&mut b);wire::envelope(0,27,&b)}
 struct Route {routes:Routes,key:(u64,u64),status:Arc<Mutex<Status>>}
@@ -13,8 +13,6 @@ impl Drop for Route {fn drop(&mut self){self.routes.lock().unwrap().remove(&self
 impl Drop for PortMap {fn drop(&mut self){self.worker.abort();for(_,r)in self.rules.lock().unwrap().drain(){let _=r.stop.send(true);}self.routes.lock().unwrap().clear();}}
 impl PortMap {
     pub fn new(io:Transport,mut rx:mpsc::Receiver<Packet>)->Self{
-        // The official Windows host answers every frame with session_id 1 whatever the viewer sent (observed),
-        // and this project's host echoes it; one port-mapping peer carries one session, so use 1.
         let session=1u64;let routes:Routes=Arc::new(Mutex::new(HashMap::new()));let route=routes.clone();
         let(life,alive)=watch::channel(());
         let worker=tokio::spawn(async move{
@@ -22,13 +20,12 @@ impl PortMap {
             while let Some((channel,b))=rx.recv().await {
                 if channel!=FILE{continue}let Some(f)=blob(&b,27)else{continue};
                 let key=(uint(f,2),uint(f,3));let sender=route.lock().unwrap().get(&key).cloned();
-                // Diagnostics without payload: wire types per field and whether session/route matched.
                 if uint(f,1)!=session || sender.is_none() {
                     let kinds=crate::protocol::decode_wire(f).map(|x|x.iter().map(|w|(w.number,match w.value{crate::protocol::WireValue::Varint(_)=>"varint",crate::protocol::WireValue::Bytes(_)=>"bytes",_=>"fixed"})).collect::<Vec<_>>()).unwrap_or_default();
                     log::warn!("Port mapping frame unmatched: fields={kinds:?} session_match={} route_match={} type={}",uint(f,1)==session,sender.is_some(),uint(f,4));
                     continue;
                 }
-                if let Some(tx)=sender {if tx.try_send((uint(f,4),blob(f,5).unwrap_or_default().to_vec())).is_err(){route.lock().unwrap().remove(&key);}}
+                if let Some(tx)=sender {if tx.send((uint(f,4),blob(f,5).unwrap_or_default().to_vec())).is_err(){route.lock().unwrap().remove(&key);}}
             }
             route.lock().unwrap().clear();
         });
@@ -52,14 +49,14 @@ impl PortMap {
                 _=streams.join_next(),if !streams.is_empty()=>{},
                 accepted=listener.accept()=>{
                     let Ok((socket,_))=accepted else{break};
+                    let _ = socket.set_nodelay(true);
                     if st.lock().unwrap().streams>=128 {continue}
-                    let stream=next.fetch_add(1,Ordering::Relaxed);let(tx,rx)=mpsc::channel(64);
+                    let stream=next.fetch_add(1,Ordering::Relaxed);let(tx,rx)=mpsc::unbounded_channel();
                     routes.lock().unwrap().insert((id,stream),tx);st.lock().unwrap().streams+=1;
                     let guard=Route{routes:routes.clone(),key:(id,stream),status:st.clone()};
                     let io=io.clone();let host=host.clone();let mut cancel=stop.clone();let mut transport_closed=disconnected.clone();
                     streams.spawn(async move {
                         let result=tokio::select!{r=forward(&io,session,id,stream,socket,rx,&host,target_port)=>r,_=cancel.changed()=>Ok(()),_=transport_closed.changed()=>Err("Forwarding transport closed".into())};
-                        // Reason only (fixed strings), never forwarded bytes or the target address.
                         if let Err(reason)=&result{guard.status.lock().unwrap().failures+=1;log::warn!("Port mapping stream ended: {reason}");}
                         let _=io.send(FILE,frame(session,id,stream,1,&[])).await;drop(guard);
                     });
@@ -76,23 +73,23 @@ impl PortMap {
         if tokio::time::timeout(TIMEOUT+Duration::from_secs(1),&mut task).await.is_err(){task.abort();return Err("Forwarding shutdown timed out".into())}Ok(())
     }
 }
-async fn forward(io:&Transport,session:u64,rule:u64,stream:u64,mut socket:TcpStream,mut rx:mpsc::Receiver<(u64,Vec<u8>)>,host:&str,port:u16)->Result<(),String>{
+async fn forward(io:&Transport,session:u64,rule:u64,stream:u64,mut socket:TcpStream,mut rx:mpsc::UnboundedReceiver<(u64,Vec<u8>)>,host:&str,port:u16)->Result<(),String>{
     let syn=serde_json::json!({"version":1,"target_host":host,"target_port":port}).to_string();
     io.send(FILE,frame(session,rule,stream,0,syn.as_bytes())).await?;
     let ack=tokio::time::timeout(Duration::from_secs(12),rx.recv()).await.map_err(|_|"Forwarding SYN timeout")?.ok_or("Forwarding channel closed")?;
     if ack.0!=3 {return Err(format!("Forwarding SYN answered with frame type {}",ack.0))}
     if serde_json::from_slice::<serde_json::Value>(&ack.1).ok().and_then(|v|v["ok"].as_bool())!=Some(true){return Err("Forwarding target rejected".into())}
-    let mut buf=vec![0;16*1024];
+    let mut buf=vec![0;32*1024];
     loop {tokio::select!{
         r=socket.read(&mut buf)=>{let n=r.map_err(|_|"Forwarding read failed")?;if n==0{break}io.send(FILE,frame(session,rule,stream,2,&buf[..n])).await?;},
-        f=rx.recv()=>match f {Some((2,b))=>if socket.write_all(&b).await.is_err(){break}/* local client hung up: a normal close */,Some((1,_))|None=>break,Some((4,_))=>{},_=>return Err("Unexpected forwarding frame".into())},
+        f=rx.recv()=>match f {Some((2,b))=>if socket.write_all(&b).await.is_err(){break},Some((1,_))|None=>break,Some((4,_))=>{},_=>return Err("Unexpected forwarding frame".into())},
     }}let _=socket.shutdown().await;Ok(())
 }
 
 pub async fn run_stdio(io:Transport,mut rx:mpsc::Receiver<Packet>,host:&str,port:u16)->Result<(),String>{
     if host.trim().is_empty() || port==0 {return Err("Invalid forwarding target".into())}
     let session=1u64;let rule=1u64;let stream=1u64;
-    let (tx,mut stream_rx)=mpsc::channel::<(u64,Vec<u8>)>(64);
+    let (tx,mut stream_rx)=mpsc::unbounded_channel::<(u64,Vec<u8>)>();
     let worker=tokio::spawn(async move{
         while let Some((channel,b))=rx.recv().await {
             if channel!=FILE{continue}
@@ -100,7 +97,7 @@ pub async fn run_stdio(io:Transport,mut rx:mpsc::Receiver<Packet>,host:&str,port
             if uint(f,1)!=session || uint(f,2)!=rule || uint(f,3)!=stream {continue}
             let kind=uint(f,4);
             let payload=blob(f,5).unwrap_or_default().to_vec();
-            if tx.send((kind,payload)).await.is_err(){break}
+            if tx.send((kind,payload)).is_err(){break}
         }
     });
     let syn=serde_json::json!({"version":1,"target_host":host,"target_port":port}).to_string();
@@ -110,7 +107,7 @@ pub async fn run_stdio(io:Transport,mut rx:mpsc::Receiver<Packet>,host:&str,port
     if serde_json::from_slice::<serde_json::Value>(&ack.1).ok().and_then(|v|v["ok"].as_bool())!=Some(true){worker.abort();return Err("Forwarding target rejected".into())}
     let mut stdin=tokio::io::stdin();
     let mut stdout=tokio::io::stdout();
-    let mut buf=vec![0u8;16*1024];
+    let mut buf=vec![0u8;32*1024];
     loop {tokio::select!{
         r=stdin.read(&mut buf)=>{let n=match r{Ok(n)=>n,Err(_)=>break};if n==0{break}if io.send(FILE,frame(session,rule,stream,2,&buf[..n])).await.is_err(){break}},
         f=stream_rx.recv()=>match f {Some((2,b))=>if stdout.write_all(&b).await.is_err()||stdout.flush().await.is_err(){break},Some((1,_))|None=>break,Some((4,_))=>{},_=>{worker.abort();return Err("Unexpected forwarding frame".into())}},

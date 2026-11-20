@@ -25,11 +25,14 @@ pub enum ClipboardRequest {
     // false means the unfocused window skipped the write.
     Write(String,tokio::sync::oneshot::Sender<Result<bool,()>>),
 }
+#[cfg(unix)]
 fn executable(name:&str)->Option<PathBuf>{
     use std::os::unix::fs::PermissionsExt;
     std::env::var_os("PATH").and_then(|p|std::env::split_paths(&p).map(|d|d.join(name))
         .find(|p|std::fs::metadata(p).is_ok_and(|m|m.is_file() && m.permissions().mode()&0o111!=0)))
 }
+#[cfg(not(unix))]
+fn executable(_name:&str)->Option<PathBuf>{ None }
 impl Backend {
     fn detect()->Option<Self>{
         if std::env::var("UU_VIEWER_CLIPBOARD").as_deref()==Ok("0"){return None}
