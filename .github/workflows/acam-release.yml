@@ -112,10 +112,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REL_TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
         run: |
-          if gh release view "$REL_TAG" >/dev/null 2>&1; then
-            gh release upload "$REL_TAG" artifacts/* --clobber
+          if gh release view "$REL_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$REL_TAG" artifacts/* --repo "${{ github.repository }}" --clobber
           else
-            gh release create "$REL_TAG" artifacts/* \
+            gh release create "$REL_TAG" artifacts/* --repo "${{ github.repository }}" --target "${{ github.sha }}" \
               --title "$REL_TAG (Linux / Windows / macOS Headless CLI)" \
               --notes "Automated cross-platform headless CLI build for Linux x86_64, Windows x86_64, macOS arm64, and macOS x86_64. Includes 4-layer anti-overlay ICE filter, full-duplex portmap/--stdio, and standalone QR login."
           fi
